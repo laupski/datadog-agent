@@ -17,6 +17,11 @@ type subscription struct {
 	done chan struct{}
 }
 
+type batchSubscription struct {
+	ch   chan []*LogSource
+	done chan struct{}
+}
+
 // LogSources serves as the interface between Schedulers and Launchers, distributing
 // notifications of added/removed LogSources to subscribed Launchers.
 //
@@ -30,19 +35,24 @@ type subscription struct {
 //
 // This type is threadsafe, and all of its methods can be called concurrently.
 type LogSources struct {
-	mu            sync.Mutex
-	sources       []*LogSource
-	added         []*subscription
-	addedByType   map[string][]*subscription
-	removed       []*subscription
-	removedByType map[string][]*subscription
+	mu      sync.Mutex
+	sources []*LogSource
+	// Validation compiles processing rules, so replay must reuse its result.
+	validSources       map[*LogSource]struct{}
+	added              []*subscription
+	addedByType        map[string][]*subscription
+	addedBatchesByType map[string][]*batchSubscription
+	removed            []*subscription
+	removedByType      map[string][]*subscription
 }
 
 // NewLogSources creates a new log sources.
 func NewLogSources() *LogSources {
 	return &LogSources{
-		addedByType:   make(map[string][]*subscription),
-		removedByType: make(map[string][]*subscription),
+		validSources:       make(map[*LogSource]struct{}),
+		addedByType:        make(map[string][]*subscription),
+		addedBatchesByType: make(map[string][]*batchSubscription),
+		removedByType:      make(map[string][]*subscription),
 	}
 }
 
@@ -51,28 +61,57 @@ func NewLogSources() *LogSources {
 // All of the subscribers registered for this source's type (src.Config.Type) will be
 // notified.
 func (s *LogSources) AddSource(source *LogSource) {
-	log.Tracef("Adding %s", source.Dump(false))
+	s.AddSources([]*LogSource{source})
+}
+
+// AddSources registers a complete configuration before notifying subscribers.
+// Individual subscriptions receive each valid source in order, while batch
+// subscriptions receive all valid sources of their type in one notification.
+func (s *LogSources) AddSources(sources []*LogSource) {
+	for _, source := range sources {
+		log.Tracef("Adding %s", source.Dump(false))
+	}
 	s.mu.Lock()
-	s.sources = append(s.sources, source)
-	if source.Config == nil || source.Config.Validate() != nil {
-		s.mu.Unlock()
-		return
+	s.sources = append(s.sources, sources...)
+	validSources := make([]*LogSource, 0, len(sources))
+	sourcesByType := make(map[string][]*LogSource)
+	streamsByType := make(map[string][]*subscription)
+	batchStreamsByType := make(map[string][]*batchSubscription)
+	for _, source := range sources {
+		if source.Config == nil || source.Config.Validate() != nil {
+			continue
+		}
+		s.validSources[source] = struct{}{}
+		validSources = append(validSources, source)
+		sourceType := source.Config.Type
+		sourcesByType[sourceType] = append(sourcesByType[sourceType], source)
+		streamsByType[sourceType] = s.addedByType[sourceType]
+		batchStreamsByType[sourceType] = s.addedBatchesByType[sourceType]
 	}
 	streams := s.added
-	streamsForType := s.addedByType[source.Config.Type]
 	s.mu.Unlock()
 
-	for _, stream := range streams {
-		select {
-		case stream.ch <- source:
-		case <-stream.done:
+	for _, source := range validSources {
+		for _, stream := range streams {
+			select {
+			case stream.ch <- source:
+			case <-stream.done:
+			}
+		}
+		for _, stream := range streamsByType[source.Config.Type] {
+			select {
+			case stream.ch <- source:
+			case <-stream.done:
+			}
 		}
 	}
 
-	for _, stream := range streamsForType {
-		select {
-		case stream.ch <- source:
-		case <-stream.done:
+	for sourceType, batch := range sourcesByType {
+		for _, stream := range batchStreamsByType[sourceType] {
+			select {
+			case stream.ch <- batch:
+			case <-stream.done:
+			}
 		}
 	}
 }
@@ -88,6 +127,9 @@ func (s *LogSources) RemoveSource(source *LogSource) {
 	for i, src := range s.sources {
 		if src == source {
 			s.sources = slices.Delete(s.sources, i, i+1)
+			if !slices.Contains(s.sources, source) {
+				delete(s.validSources, source)
+			}
 			sourceFound = true
 			break
 		}
@@ -175,6 +217,36 @@ func (s *LogSources) SubscribeForType(sourceType string, addedDone, removedDone 
 			}
 		}
 	}()
+
+	return added.ch, removed.ch
+}
+
+// SubscribeForTypeBatches subscribes to additions grouped by configuration and
+// individual removals for the given source type. Previously registered valid
+// sources are replayed as one batch. Subscribers must not modify batch slices.
+func (s *LogSources) SubscribeForTypeBatches(sourceType string, addedDone, removedDone chan struct{}) (chan []*LogSource, chan *LogSource) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	added := &batchSubscription{ch: make(chan []*LogSource), done: addedDone}
+	removed := &subscription{ch: make(chan *LogSource), done: removedDone}
+	s.addedBatchesByType[sourceType] = append(s.addedBatchesByType[sourceType], added)
+	s.removedByType[sourceType] = append(s.removedByType[sourceType], removed)
+
+	var existingSources []*LogSource
+	for _, source := range s.sources {
+		if _, valid := s.validSources[source]; valid && source.Config.Type == sourceType {
+			existingSources = append(existingSources, source)
+		}
+	}
+	if len(existingSources) > 0 {
+		go func() {
+			select {
+			case added.ch <- existingSources:
+			case <-addedDone:
+			}
+		}()
+	}
 
 	return added.ch, removed.ch
 }

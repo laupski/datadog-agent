@@ -32,6 +32,10 @@ type SourceManager interface {
 	// tailers and begin forwarding messages.
 	AddSource(source *sources.LogSource)
 
+	// AddSources registers all rules from a configuration together, allowing
+	// launchers to select files across the complete configuration.
+	AddSources(sources []*sources.LogSource)
+
 	// RemoveSource removes an existing source from the logs agent.  The
 	// source is recognized by pointer equality.
 	RemoveSource(source *sources.LogSource)

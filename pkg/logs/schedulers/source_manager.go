@@ -26,6 +26,11 @@ func (sm *sourceManager) AddSource(source *sources.LogSource) {
 	sm.sources.AddSource(source)
 }
 
+// AddSources implements SourceManager#AddSources.
+func (sm *sourceManager) AddSources(sources []*sources.LogSource) {
+	sm.sources.AddSources(sources)
+}
+
 // RemoveSource implements SourceManager#RemoveSource.
 func (sm *sourceManager) RemoveSource(source *sources.LogSource) {
 	sm.sources.RemoveSource(source)
@@ -76,6 +81,13 @@ var _ SourceManager = &MockSourceManager{}
 // AddSource implements SourceManager#AddSource.
 func (sm *MockSourceManager) AddSource(source *sources.LogSource) {
 	sm.Events = append(sm.Events, MockAddRemove{Add: true, Source: source})
+}
+
+// AddSources implements SourceManager#AddSources.
+func (sm *MockSourceManager) AddSources(sources []*sources.LogSource) {
+	for _, source := range sources {
+		sm.AddSource(source)
+	}
 }
 
 // RemoveSource implements SourceManager#RemoveSource.

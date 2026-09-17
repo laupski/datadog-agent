@@ -6,6 +6,8 @@
 // Package sources provides log source configuration and management
 package sources
 
+import "slices"
+
 // ConfigSources receives file paths to log configs and creates sources. The sources are added to a channel and read by the launcher.
 // This class implements the SourceProvider interface
 type ConfigSources struct {
@@ -42,6 +44,22 @@ func (s *ConfigSources) SubscribeForType(sourceType string, addedDone, _ chan st
 		}
 	}()
 
+	return added, nil
+}
+
+// SubscribeForTypeBatches returns all configured sources of the requested type
+// in one notification.
+func (s *ConfigSources) SubscribeForTypeBatches(sourceType string, addedDone, _ chan struct{}) (chan []*LogSource, chan *LogSource) {
+	added := make(chan []*LogSource)
+	batch := slices.Clone(s.addedByType[sourceType])
+	if len(batch) > 0 {
+		go func() {
+			select {
+			case added <- batch:
+			case <-addedDone:
+			}
+		}()
+	}
 	return added, nil
 }
 

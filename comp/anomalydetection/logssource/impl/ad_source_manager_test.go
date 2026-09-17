@@ -75,3 +75,20 @@ func TestADSourceManagerAddSourceKeepsUnknownContainer(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Same(t, src, got[0])
 }
+
+func TestADSourceManagerAddSourcesFiltersAgentContainer(t *testing.T) {
+	wmeta := newWMetaMock(t)
+	wmeta.Set(runningContainer("agent-container", "gcr.io/datadoghq/datadog-agent"))
+	logSources := sources.NewLogSources()
+	sp := newSourceProvider(wmeta, logSources, nil)
+	mgr := newADSourceManager(logSources, service.NewServices(), sp)
+	first := newContainerADSource("first-app")
+	second := newContainerADSource("second-app")
+
+	mgr.AddSources([]*sources.LogSource{first, newContainerADSource("agent-container"), second})
+
+	assert.Equal(t, []*sources.LogSource{first, second}, logSources.GetSources())
+	assert.True(t, isSuppressed(sp, "first-app"))
+	assert.True(t, isSuppressed(sp, "second-app"))
+	assert.False(t, isSuppressed(sp, "agent-container"))
+}

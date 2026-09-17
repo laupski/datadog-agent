@@ -87,9 +87,7 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 			}
 
 			filtered := s.filterConflictingSources(sources, config.Provider)
-			for _, source := range filtered {
-				s.mgr.AddSource(source)
-			}
+			s.mgr.AddSources(filtered)
 		default:
 			log.Debugf("Invalid integration config: %s, ignoring it", configName(config))
 			continue

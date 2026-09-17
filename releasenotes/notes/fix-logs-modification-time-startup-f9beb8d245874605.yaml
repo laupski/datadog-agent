@@ -1,0 +1,9 @@
+---
+fixes:
+  - |
+    When ``logs_config.file_wildcard_selection_mode`` is set to
+    ``by_modification_time``, consider all file rules in a log configuration
+    together before starting collection. This prevents the first rule from
+    temporarily occupying the entire open-file limit at startup, even when
+    later rules match newer files. Newly added rules also trigger selection
+    without waiting for the next periodic scan.

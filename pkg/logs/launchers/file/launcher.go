@@ -42,8 +42,12 @@ const DefaultSleepDuration = 1 * time.Second
 type Launcher struct {
 	pipelineProvider    pipeline.Provider
 	addedSources        chan *sources.LogSource
+	addedSourceBatches  chan []*sources.LogSource
 	removedSources      chan *sources.LogSource
 	activeSources       []*sources.LogSource
+	globalSelection     bool
+	sourceGeneration    uint64
+	pendingSources      map[*sources.LogSource]config.TailingMode
 	addedSourcesDone    chan struct{}
 	removedSourcesDone  chan struct{}
 	tailingLimit        int
@@ -61,7 +65,7 @@ type Launcher struct {
 	scanPeriod              time.Duration
 	flarecontroller         *flareController.FlareController
 	tagger                  tagger.Component
-	filesChan               chan []*tailer.File
+	filesChan               chan fileScan
 	filesTailedBetweenScans []*tailer.File
 	// Scan keys of files that started being skipped for an unusable fingerprint while a scan was in
 	// flight. Serves the same purpose as filesTailedBetweenScans, for files that got no tailer, and
@@ -87,6 +91,12 @@ const (
 type oldTailerInfo struct {
 	Pattern      *regexp.Regexp
 	InfoRegistry *status.InfoRegistry
+}
+
+type fileScan struct {
+	files      []*tailer.File
+	sources    []*sources.LogSource
+	generation uint64
 }
 
 // NewLauncher returns a new launcher.
@@ -116,6 +126,8 @@ func NewLauncher(
 	return &Launcher{
 		addedSourcesDone:       make(chan struct{}),
 		removedSourcesDone:     make(chan struct{}),
+		globalSelection:        wildcardStrategy == fileprovider.WildcardUseFileModTime,
+		pendingSources:         make(map[*sources.LogSource]config.TailingMode),
 		tailingLimit:           tailingLimit,
 		fileProvider:           fileprovider.NewFileProvider(tailingLimit, wildcardStrategy),
 		tailers:                tailers.NewTailerContainer[*tailer.Tailer](),
@@ -127,7 +139,7 @@ func NewLauncher(
 		scanPeriod:             scanPeriod,
 		flarecontroller:        flarecontroller,
 		tagger:                 tagger,
-		filesChan:              make(chan []*tailer.File, 1),
+		filesChan:              make(chan fileScan, 1),
 		oldInfoMap:             make(map[string]*oldTailerInfo),
 		fingerprintSkips:       make(map[string]*fingerprintSkip),
 		fileOpener:             fileOpener,
@@ -138,7 +150,11 @@ func NewLauncher(
 // Start starts the Launcher
 func (s *Launcher) Start(sourceProvider launchers.SourceProvider, pipelineProvider pipeline.Provider, registry auditor.Registry, tracker *tailers.TailerTracker) {
 	s.pipelineProvider = pipelineProvider
-	s.addedSources, s.removedSources = sourceProvider.SubscribeForType(config.FileType, s.addedSourcesDone, s.removedSourcesDone)
+	if batchProvider, ok := sourceProvider.(launchers.SourceBatchProvider); s.globalSelection && ok {
+		s.addedSourceBatches, s.removedSources = batchProvider.SubscribeForTypeBatches(config.FileType, s.addedSourcesDone, s.removedSourcesDone)
+	} else {
+		s.addedSources, s.removedSources = sourceProvider.SubscribeForType(config.FileType, s.addedSourcesDone, s.removedSourcesDone)
+	}
 	s.registry = registry
 	tracker.Add(s.tailers)
 	go s.run()
@@ -166,32 +182,58 @@ func (s *Launcher) run() {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scanRunning := false
+	startScan := func() {
+		if scanRunning {
+			return
+		}
+		scanRunning = true
+		result := fileScan{
+			sources:    slices.Clone(s.activeSources),
+			generation: s.sourceGeneration,
+		}
+		// The snapshot already covers files started before this scan.
+		s.filesTailedBetweenScans = s.filesTailedBetweenScans[:0]
+		s.filesSkippedBetweenScans = s.filesSkippedBetweenScans[:0]
+		scanTicker.Stop()
+		go func() {
+			result.files = s.fileProvider.FilesToTail(ctx, s.validatePodContainerID, result.sources, s.registry)
+			select {
+			case s.filesChan <- result:
+			case <-ctx.Done():
+			}
+		}()
+	}
 	for {
 		select {
 		case source := <-s.addedSources:
 			s.addSource(source)
+			if s.globalSelection {
+				startScan()
+			}
+		case batch := <-s.addedSourceBatches:
+			for _, source := range batch {
+				s.addSource(source)
+			}
+			startScan()
 		case source := <-s.removedSources:
 			s.removeSource(source)
+			if s.globalSelection {
+				startScan()
+			}
 		case <-scanTicker.C:
-
-			activeSourcesCopy := make([]*sources.LogSource, len(s.activeSources))
-			copy(activeSourcesCopy, s.activeSources)
-
-			// Clear the between-scans state before starting a new FilesToTail: the copy of
-			// activeSources it receives already covers the sources these files came from, so its
-			// result will mention them on its own.
-			s.filesTailedBetweenScans = s.filesTailedBetweenScans[:0]
-			s.filesSkippedBetweenScans = s.filesSkippedBetweenScans[:0]
-
-			scanTicker.Stop()
-			go func() {
-				s.filesChan <- s.fileProvider.FilesToTail(ctx, s.validatePodContainerID, activeSourcesCopy, s.registry)
-			}()
-		case files := <-s.filesChan:
+			startScan()
+		case result := <-s.filesChan:
+			scanRunning = false
 			s.cleanUpRotatedTailers()
-
-			s.resolveActiveTailers(files)
-			scanTicker.Reset(s.scanPeriod)
+			s.applyScan(result)
+			if s.globalSelection && result.generation != s.sourceGeneration {
+				// Sources arriving during discovery should not wait another scan period.
+				startScan()
+			} else {
+				scanTicker.Reset(s.scanPeriod)
+			}
 		case <-s.stop:
 			// Cancel the context passed to fileProvider.FilesToTail
 			cancel()
@@ -199,6 +241,25 @@ func (s *Launcher) run() {
 			s.cleanup()
 			return
 		}
+	}
+}
+
+func (s *Launcher) applyScan(result fileScan) {
+	hitFileLimit := len(result.files) >= s.tailingLimit
+	if s.globalSelection {
+		active := make(map[*sources.LogSource]bool, len(s.activeSources))
+		for _, source := range s.activeSources {
+			active[source] = true
+		}
+		result.files = slices.DeleteFunc(result.files, func(file *tailer.File) bool {
+			return !active[file.Source.UnderlyingSource()]
+		})
+	}
+	s.resolveActiveTailersWithLimit(result.files, hitFileLimit)
+	// Only consume initial modes for sources covered by this scan. New sources
+	// added while discovery ran still need their configured startup mode.
+	for _, source := range result.sources {
+		delete(s.pendingSources, source)
 	}
 }
 
@@ -234,6 +295,10 @@ func (s *Launcher) cleanup() {
 // The Scanner needs to stop that previous tailer, and start a new one for the
 // new file.
 func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
+	s.resolveActiveTailersWithLimit(files, len(files) >= s.tailingLimit)
+}
+
+func (s *Launcher) resolveActiveTailersWithLimit(files []*tailer.File, hitFileLimit bool) {
 	// resolveActiveTailers() receives the files parameter from FilesToTail(),
 	// which is called in the main run loop of launcher. FilesToTail() is always
 	// executed concurrently.  It is therefore possible that addSource() can be
@@ -243,10 +308,8 @@ func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
 	// added during a concurrent scan.  In order to mitigate that possibility, any
 	// tailers started while FilesToTail() is running need to be merged with the
 	// result of FilesToTail() to prevent scan() from unscheudling them.
-	// FilesToTail returns at most tailingLimit files, so a result that reached the limit may have
-	// left out files that are still matched. Read before the merge below, which can push the count
-	// past the limit on its own.
-	hitFileLimit := len(files) >= s.tailingLimit
+	// A scan that reached the limit may have left out files that are still matched.
+	// Preserve that fact when filtering removed sources or merging files below.
 
 	files = append(files, s.filesTailedBetweenScans...)
 	s.filesTailedBetweenScans = s.filesTailedBetweenScans[:0]
@@ -291,6 +354,9 @@ func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
 			filesExpected[scanKey] = true
 		}
 		tailered, isTailed := s.tailers.Get(scanKey)
+		if isTailed {
+			s.replaceInitialSource(tailered, file)
+		}
 		if isTailed && tailered.IsFinished() {
 			// skip this tailer as it must be stopped
 			log.Debugf("Tailer for %s has finished, it will be stopped and a new one started for this file", file.Path)
@@ -356,8 +422,9 @@ func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
 	// Pass 2 - Create new tailers for files that need to be tailed
 	for _, file := range files {
 		scanKey := file.GetScanKey()
-		_, isTailed := s.tailers.Get(scanKey)
+		existing, isTailed := s.tailers.Get(scanKey)
 		if isTailed {
+			s.replaceInitialSource(existing, file)
 			filesTailed[scanKey] = true
 			continue
 		}
@@ -398,7 +465,11 @@ func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
 			}
 		} else {
 			// Normal case - no stored info
-			if s.startNewTailer(file, config.Beginning, fingerprint) {
+			mode := config.TailingMode(config.Beginning)
+			if initialMode, initial := s.pendingSources[file.Source.UnderlyingSource()]; initial {
+				mode = initialMode
+			}
+			if s.startNewTailer(file, mode, fingerprint) {
 				filesTailed[scanKey] = true
 				s.resolveFingerprintSkip(file)
 			}
@@ -420,6 +491,14 @@ func (s *Launcher) resolveActiveTailers(files []*tailer.File) {
 	}
 }
 
+func (s *Launcher) replaceInitialSource(t *tailer.Tailer, file *tailer.File) {
+	source := file.Source.UnderlyingSource()
+	if _, initial := s.pendingSources[source]; initial && t.Source() != source {
+		source.SetStatus(t.Source().Status())
+		t.ReplaceSource(source)
+	}
+}
+
 // cleanUpRotatedTailers removes any rotated tailers that have stopped from the list
 func (s *Launcher) cleanUpRotatedTailers() {
 	pendingTailers := []*tailer.Tailer{}
@@ -431,9 +510,15 @@ func (s *Launcher) cleanUpRotatedTailers() {
 	s.rotatedTailers = pendingTailers
 }
 
-// addSource keeps track of the new source and launch new tailers for this source.
+// addSource registers a source. Global selection defers tailers until the scan
+// has compared files across every source in the configuration batch.
 func (s *Launcher) addSource(source *sources.LogSource) {
 	s.activeSources = append(s.activeSources, source)
+	s.sourceGeneration++
+	if s.globalSelection {
+		s.pendingSources[source] = initialTailingMode(source)
+		return
+	}
 	s.launchTailers(source)
 }
 
@@ -443,6 +528,8 @@ func (s *Launcher) removeSource(source *sources.LogSource) {
 		if src == source {
 			// no need to stop the tailer here, it will be stopped in the next iteration of scan.
 			s.activeSources = slices.Delete(s.activeSources, i, i+1)
+			s.sourceGeneration++
+			delete(s.pendingSources, source)
 			break
 		}
 	}
@@ -510,18 +597,21 @@ func (s *Launcher) launchTailers(source *sources.LogSource) {
 			}
 		}
 
-		mode, isSet := config.TailingModeFromString(source.GetTailingMode())
-		if !isSet && source.Config.Identifier != "" {
-			mode = config.Beginning
-			source.SetTailingMode(mode.String())
-		}
-
-		newTailerStarted := s.startNewTailer(file, mode, fingerprint)
+		newTailerStarted := s.startNewTailer(file, initialTailingMode(source), fingerprint)
 		if newTailerStarted {
 			s.resolveFingerprintSkip(file)
 			s.filesTailedBetweenScans = append(s.filesTailedBetweenScans, file)
 		}
 	}
+}
+
+func initialTailingMode(source *sources.LogSource) config.TailingMode {
+	mode, isSet := config.TailingModeFromString(source.GetTailingMode())
+	if !isSet && source.Config.Identifier != "" {
+		mode = config.Beginning
+		source.SetTailingMode(mode.String())
+	}
+	return mode
 }
 
 // startNewTailer creates a new tailer, making it tail from the last committed offset, the beginning or the end of the file,

@@ -45,3 +45,9 @@ type SourceProvider interface {
 	// GetAddedForType returns channels containing the new added sources matching the provided type.
 	GetAddedForType(sourceType string, addedDone chan struct{}) chan *sources.LogSource
 }
+
+// SourceBatchProvider preserves configuration batches for launchers that select
+// files across sources before starting any tailers.
+type SourceBatchProvider interface {
+	SubscribeForTypeBatches(sourceType string, addedDone, removedDone chan struct{}) (chan []*sources.LogSource, chan *sources.LogSource)
+}

@@ -29,6 +29,39 @@ func setup() (scheduler *Scheduler, spy *schedulers.MockSourceManager) {
 	return scheduler, spy
 }
 
+type batchSourceManager struct {
+	schedulers.MockSourceManager
+	batches [][]*sourcesPkg.LogSource
+}
+
+func (m *batchSourceManager) AddSources(batch []*sourcesPkg.LogSource) {
+	m.batches = append(m.batches, batch)
+	m.MockSourceManager.AddSources(batch)
+}
+
+func TestSchedulePublishesConfigurationAsOneBatch(t *testing.T) {
+	scheduler := New(nil).(*Scheduler)
+	manager := &batchSourceManager{}
+	scheduler.mgr = manager
+	scheduler.Schedule([]integration.Config{{
+		Name:     "application",
+		Provider: names.File,
+		LogsConfig: []byte(`logs:
+  - type: file
+    path: /var/log/first/*.log
+  - type: file
+    path: /var/log/second/*.log
+  - type: file
+    path: /var/log/third/*.log`),
+	}})
+
+	require.Len(t, manager.batches, 1)
+	require.Len(t, manager.batches[0], 3)
+	assert.Equal(t, "/var/log/first/*.log", manager.batches[0][0].Config.Path)
+	assert.Equal(t, "/var/log/second/*.log", manager.batches[0][1].Config.Path)
+	assert.Equal(t, "/var/log/third/*.log", manager.batches[0][2].Config.Path)
+}
+
 func TestScheduleConfigCreatesNewSource(t *testing.T) {
 	scheduler, spy := setup()
 	configSource := integration.Config{

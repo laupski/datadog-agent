@@ -28,6 +28,92 @@ func TestAddSource(t *testing.T) {
 	assert.Equal(t, 3, len(sources.GetSources()))
 }
 
+func TestAddSourcesRegistersCompleteBatchBeforeNotifications(t *testing.T) {
+	logSources := NewLogSources()
+	done := make(chan struct{})
+	defer close(done)
+	individual, individualRemoved := logSources.SubscribeAll(done, done)
+	typed, typedRemoved := logSources.SubscribeForType(config.FileType, done, done)
+	batches, removed := logSources.SubscribeForTypeBatches(config.FileType, done, done)
+	first := NewLogSource("first", &config.LogsConfig{Type: config.FileType, Path: "first.log"})
+	second := NewLogSource("second", &config.LogsConfig{Type: config.FileType, Path: "second.log"})
+	otherType := NewLogSource("other", &config.LogsConfig{Type: config.DockerType})
+	invalid := NewLogSource("invalid", &config.LogsConfig{Type: config.FileType})
+	batch := []*LogSource{first, otherType, invalid, second}
+	complete := make(chan struct{})
+	go func() {
+		logSources.AddSources(batch)
+		close(complete)
+	}()
+
+	assert.Same(t, first, receiveSourceNotification(t, individual))
+	assert.Equal(t, batch, logSources.GetSources())
+	assert.Same(t, first, receiveSourceNotification(t, typed))
+	assert.Same(t, otherType, receiveSourceNotification(t, individual))
+	assert.Same(t, second, receiveSourceNotification(t, individual))
+	assert.Same(t, second, receiveSourceNotification(t, typed))
+	assert.Equal(t, []*LogSource{first, second}, receiveSourceNotification(t, batches))
+	receiveSourceNotification(t, complete)
+
+	go logSources.RemoveSource(first)
+	assert.Same(t, first, receiveSourceNotification(t, individualRemoved))
+	assert.Same(t, first, receiveSourceNotification(t, typedRemoved))
+	assert.Same(t, first, receiveSourceNotification(t, removed))
+}
+
+func TestSubscribeForTypeBatchesReplaysValidSourcesTogether(t *testing.T) {
+	logSources := NewLogSources()
+	first := NewLogSource("first", &config.LogsConfig{Type: config.FileType, Path: "first.log"})
+	second := NewLogSource("second", &config.LogsConfig{Type: config.FileType, Path: "second.log"})
+	logSources.AddSources([]*LogSource{
+		first,
+		NewLogSource("invalid", &config.LogsConfig{Type: config.FileType}),
+		NewLogSource("missing config", nil),
+		NewLogSource("other", &config.LogsConfig{Type: config.DockerType}),
+		second,
+	})
+	done := make(chan struct{})
+	defer close(done)
+	batches, _ := logSources.SubscribeForTypeBatches(config.FileType, done, done)
+	assert.Equal(t, []*LogSource{first, second}, receiveSourceNotification(t, batches))
+
+	third := NewLogSource("third", &config.LogsConfig{Type: config.FileType, Path: "third.log"})
+	go logSources.AddSource(third)
+	assert.Equal(t, []*LogSource{third}, receiveSourceNotification(t, batches))
+}
+
+func TestSubscribeForTypeBatchesSkipsStoppedSubscribers(t *testing.T) {
+	logSources := NewLogSources()
+	oldDone := make(chan struct{})
+	logSources.SubscribeForTypeBatches(config.FileType, oldDone, oldDone)
+	close(oldDone)
+	done := make(chan struct{})
+	defer close(done)
+	batches, removed := logSources.SubscribeForTypeBatches(config.FileType, done, done)
+	source := NewLogSource("file", &config.LogsConfig{Type: config.FileType, Path: "file.log"})
+	complete := make(chan struct{})
+	go func() {
+		logSources.AddSource(source)
+		logSources.RemoveSource(source)
+		close(complete)
+	}()
+	assert.Equal(t, []*LogSource{source}, receiveSourceNotification(t, batches))
+	assert.Same(t, source, receiveSourceNotification(t, removed))
+	receiveSourceNotification(t, complete)
+}
+
+func receiveSourceNotification[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for source notification")
+		var zero T
+		return zero
+	}
+}
+
 func TestRemoveSource(t *testing.T) {
 	sources := NewLogSources()
 	source1 := NewLogSource("foo", &config.LogsConfig{Type: "boo"})

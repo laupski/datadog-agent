@@ -41,12 +41,24 @@ func newADSourceManager(logSources *sources.LogSources, services *service.Servic
 // suppression evicts any generic source, eliminating the TOCTOU window where
 // neither source would be active.
 func (m *adSourceManager) AddSource(src *sources.LogSource) {
-	if isContainerSource(src) && m.sp.isAgentContainerID(src.Config.Identifier) {
-		return
+	m.AddSources([]*sources.LogSource{src})
+}
+
+// AddSources implements schedulers.SourceManager, preserving configuration
+// batches after filtering the Agent's own container sources.
+func (m *adSourceManager) AddSources(batch []*sources.LogSource) {
+	filtered := make([]*sources.LogSource, 0, len(batch))
+	for _, src := range batch {
+		if isContainerSource(src) && m.sp.isAgentContainerID(src.Config.Identifier) {
+			continue
+		}
+		filtered = append(filtered, src)
 	}
-	m.logSources.AddSource(src)
-	if isContainerSource(src) {
-		m.sp.suppressIdentifier(src.Config.Identifier)
+	m.logSources.AddSources(filtered)
+	for _, src := range filtered {
+		if isContainerSource(src) {
+			m.sp.suppressIdentifier(src.Config.Identifier)
+		}
 	}
 }
 

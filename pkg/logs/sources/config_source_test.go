@@ -79,3 +79,17 @@ func TestSubscribeForTypeAndAddFileSource(t *testing.T) {
 	assert.Equal(t, "file", added.Config.Type)
 	assert.Equal(t, "/tmp/test.log", added.Config.Path)
 }
+
+func TestConfigSourcesSubscribeForTypeBatches(t *testing.T) {
+	configSources := NewConfigSources()
+	first := NewLogSource("first", &logsConfig.LogsConfig{Type: logsConfig.FileType, Path: "first.log"})
+	second := NewLogSource("second", &logsConfig.LogsConfig{Type: logsConfig.FileType, Path: "second.log"})
+	configSources.AddSource(first)
+	configSources.AddSource(NewLogSource("other", &logsConfig.LogsConfig{Type: logsConfig.DockerType}))
+	configSources.AddSource(second)
+	done := make(chan struct{})
+	defer close(done)
+	added, removed := configSources.SubscribeForTypeBatches(logsConfig.FileType, done, done)
+	assert.Nil(t, removed)
+	assert.Equal(t, []*LogSource{first, second}, receiveSourceNotification(t, added))
+}
